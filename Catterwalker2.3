@@ -1,0 +1,162 @@
+#include <iostream>
+#include <vector>
+
+extern "C" {
+#include <libavcodec/avcodec.h>
+#include <libavformat/avformat.h>
+#include <libavutil/opt.h>
+#include <libavutil/imgutils.h>
+#include <libswscale/swscale.h>
+}
+
+// Target Specs for High-Quality TikTok Output
+const int WIDTH = 1080;
+const int HEIGHT = 1920;
+const int FPS = 120;
+const int DURATION_SEC = 5;
+const int BIT_RATE = 18000000; // 18 Mbps high quality baseline
+
+int main() {
+    avformat_network_init();
+
+    const char* filename = "tiktok_high_quality_120fps.mp4";
+    AVFormatContext* outFormatContext = nullptr;
+    
+    // Allocate the output context
+    avformat_alloc_output_context2(&outFormatContext, nullptr, "mp4", filename);
+    if (!outFormatContext) {
+        std::cerr << "Could not create output context." << std::endl;
+        return -1;
+    }
+
+    // Find the H.264 encoder (most compatible codec for mobile upload)
+    const AVCodec* codec = avcodec_find_encoder(AV_CODEC_ID_H264);
+    if (!codec) {
+        std::cerr << "H.264 Encoder not found." << std::endl;
+        return -1;
+    }
+
+    // Create a new video stream
+    AVStream* stream = avformat_new_stream(outFormatContext, codec);
+    if (!stream) {
+        std::cerr << "Could not create new stream." << std::endl;
+        return -1;
+    }
+
+    AVCodecContext* codecContext = avcodec_alloc_context3(codec);
+    if (!codecContext) {
+        std::cerr << "Could not allocate codec context." << std::endl;
+        return -1;
+    }
+
+    // Set parameters for high quality & smooth framerate
+    codecContext->codec_id = AV_CODEC_ID_H264;
+    codecContext->bit_rate = BIT_RATE;
+    codecContext->width = WIDTH;
+    codecContext->height = HEIGHT;
+    
+    // Time base definition for 120 FPS
+    stream->time_base = (AVRational){1, FPS};
+    codecContext->time_base = stream->time_base;
+    codecContext->framerate = (AVRational){FPS, 1};
+    
+    codecContext->gop_size = FPS / 2; // Keyframe every half second for smoother scrubbing
+    codecContext->max_b_frames = 2;
+    codecContext->pix_fmt = AV_PIX_FMT_YUV420P; // Standard mobile pixel format
+
+    // Set encoding quality flags
+    av_opt_set(codecContext->priv_data, "preset", "slow", 0);  // High quality compression
+    av_opt_set(codecContext->priv_data, "crf", "16", 0);      // High visual fidelity (0-51, lower = better)
+    
+    if (outFormatContext->oformat->flags & AVFMT_GLOBALHEADER) {
+        codecContext->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
+    }
+
+    if (avcodec_open2(codecContext, codec, nullptr) < 0) {
+        std::cerr << "Could not open video codec." << std::endl;
+        return -1;
+    }
+
+    avcodec_parameters_from_context(stream->codecpar, codecContext);
+
+    // Open output file
+    if (!(outFormatContext->oformat->flags & AVFMT_NOFILE)) {
+        if (avio_open(&outFormatContext->pb, filename, AVIO_FLAG_WRITE) < 0) {
+            std::cerr << "Could not open file " << filename << std::endl;
+            return -1;
+        }
+    }
+
+    // Write container header with faststart optimized for mobile processing
+    AVDictionary* opts = nullptr;
+    av_dict_set(&opts, "movflags", "faststart", 0);
+    if (avformat_write_header(outFormatContext, &opts) < 0) {
+        std::cerr << "Error occurred when writing header." << std::endl;
+        return -1;
+    }
+
+    // Allocate Video Frame
+    AVFrame* frame = av_frame_alloc();
+    frame->format = codecContext->pix_fmt;
+    frame->width  = codecContext->width;
+    frame->height = codecContext->height;
+    av_frame_get_buffer(frame, 0);
+
+    AVPacket* pkt = av_packet_alloc();
+    int totalFrames = FPS * DURATION_SEC;
+
+    // Generate synthesized test pattern at 120 FPS
+    for (int i = 0; i < totalFrames; i++) {
+        av_frame_make_writable(frame);
+
+        // Y (Luminance) channel sweep animation
+        for (int y = 0; y < HEIGHT; y++) {
+            for (int x = 0; x < WIDTH; x++) {
+                frame->data[0][y * frame->linesize[0] + x] = static_cast<uint8_t>(x + y + i * 3);
+            }
+        }
+        // U & V (Chroma) channels
+        for (int y = 0; y < HEIGHT / 2; y++) {
+            for (int x = 0; x < WIDTH / 2; x++) {
+                frame->data[1][y * frame->linesize[1] + x] = 128 + y + i;
+                frame->data[2][y * frame->linesize[2] + x] = 64 + x + i;
+            }
+        }
+
+        frame->pts = i;
+
+        // Encode Frame
+        if (avcodec_send_frame(codecContext, frame) >= 0) {
+            while (avcodec_receive_packet(codecContext, pkt) >= 0) {
+                av_packet_rescale_ts(pkt, codecContext->time_base, stream->time_base);
+                pkt->stream_index = stream->index;
+                av_interleaved_write_frame(outFormatContext, pkt);
+                av_packet_unref(pkt);
+            }
+        }
+    }
+
+    // Flush encoder buffer
+    avcodec_send_frame(codecContext, nullptr);
+    while (avcodec_receive_packet(codecContext, pkt) >= 0) {
+        av_packet_rescale_ts(pkt, codecContext->time_base, stream->time_base);
+        pkt->stream_index = stream->index;
+        av_interleaved_write_frame(outFormatContext, pkt);
+        av_packet_unref(pkt);
+    }
+
+    // Write Trailer & Cleanup
+    av_write_trailer(outFormatContext);
+    
+    av_frame_free(&frame);
+    av_packet_free(&pkt);
+    avcodec_free_context(&codecContext);
+    
+    if (!(outFormatContext->oformat->flags & AVFMT_NOFILE)) {
+        avio_closep(&outFormatContext->pb);
+    }
+    avformat_free_context(outFormatContext);
+
+    std::cout << "Successfully exported high quality video: " << filename << std::endl;
+    return 0;
+}
